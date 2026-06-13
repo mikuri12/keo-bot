@@ -110,6 +110,17 @@ async def ask_gemini(channel_id: int, user_message: str) -> str:
 
         response = await asyncio.to_thread(_call_gemini)
 
+        # Log if search grounding was used
+        if response.candidates and response.candidates[0].grounding_metadata:
+            gm = response.candidates[0].grounding_metadata
+            chunks = getattr(gm, 'grounding_chunks', None)
+            if chunks:
+                log.info("Search grounding used: %d sources", len(chunks))
+            else:
+                log.info("No search grounding in response")
+        else:
+            log.info("No grounding metadata in response")
+
         reply = response.text or "Hmm, no pude generar una respuesta. Intenta de nuevo bro 🤔"
         save_assistant_response(channel_id, reply)
         return reply

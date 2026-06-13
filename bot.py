@@ -104,6 +104,7 @@ async def ask_gemini(channel_id: int, user_message: str) -> str:
                     temperature=0.7,
                     max_output_tokens=1024,
                     top_p=0.9,
+                    tools=[types.Tool(google_search=types.GoogleSearch())],
                 ),
             )
 

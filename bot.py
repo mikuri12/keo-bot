@@ -51,7 +51,7 @@ if ALLOWED_CHANNELS_RAW.strip():
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # Model to use (free tier compatible)
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-2.5-flash"
 
 # ── Conversation Memory ─────────────────────────────────────
 # Stores recent messages per channel for context (max N turns)
@@ -94,16 +94,20 @@ async def ask_gemini(channel_id: int, user_message: str) -> str:
     try:
         contents = build_contents(channel_id, user_message)
 
-        response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=get_system_prompt(),
-                temperature=0.7,
-                max_output_tokens=1024,
-                top_p=0.9,
-            ),
-        )
+        # Run sync Gemini call in a thread to not block the event loop
+        def _call_gemini():
+            return gemini_client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=get_system_prompt(),
+                    temperature=0.7,
+                    max_output_tokens=1024,
+                    top_p=0.9,
+                ),
+            )
+
+        response = await asyncio.to_thread(_call_gemini)
 
         reply = response.text or "Hmm, no pude generar una respuesta. Intenta de nuevo bro 🤔"
         save_assistant_response(channel_id, reply)
@@ -111,7 +115,7 @@ async def ask_gemini(channel_id: int, user_message: str) -> str:
 
     except Exception as e:
         log.error("Gemini API error: %s", e, exc_info=True)
-        return "Ups, tuve un problema conectándome. Intenta de nuevo en un momento ⚠️"
+        return f"Ups, tuve un problema conectándome. Intenta de nuevo en un momento ⚠️"
 
 
 # ── Discord Bot ──────────────────────────────────────────────
@@ -144,7 +148,12 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # Check if the bot should respond
+    # Process commands first (e.g., !keo ping, !keo help)
+    if message.content.startswith("!keo "):
+        await bot.process_commands(message)
+        return
+
+    # Check if the bot should respond to AI queries
     should_respond = False
 
     # Respond when mentioned
@@ -153,10 +162,6 @@ async def on_message(message: discord.Message):
 
     # Respond to DMs
     if isinstance(message.channel, discord.DMChannel):
-        should_respond = True
-
-    # Respond if message starts with the prefix
-    if message.content.startswith("!keo "):
         should_respond = True
 
     if not should_respond:

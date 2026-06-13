@@ -171,7 +171,7 @@ def analyze_video_with_gemini(video_path: Path) -> dict | None:
 
         # Analyze the video
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash",
             contents=[
                 types.Content(
                     role="user",

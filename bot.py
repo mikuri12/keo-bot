@@ -50,8 +50,16 @@ if ALLOWED_CHANNELS_RAW.strip():
 # ── Gemini Client ────────────────────────────────────────────
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Model to use (free tier compatible)
-GEMINI_MODEL = "gemini-2.5-flash"
+# Models to try in order — prioritized by daily quota (RPD)
+# If one model hits the rate limit, we try the next one
+GEMINI_MODELS = [
+    "gemini-3.1-flash-lite",    # 15 RPM, 500 RPD  ← PRINCIPAL (con Google Search)
+    "gemma-4-26b-it",           # 15 RPM, 1500 RPD (sin search, fallback)
+    "gemma-4-31b-it",           # 15 RPM, 1500 RPD (sin search, fallback)
+]
+# Total: ~3,500 requests por día
+# Gemma models don't support Google Search tool
+MODELS_WITHOUT_SEARCH = {"gemma-4-26b-it", "gemma-4-31b-it"}
 
 # ── Conversation Memory ─────────────────────────────────────
 # Stores recent messages per channel for context (max N turns)
@@ -90,44 +98,57 @@ def save_assistant_response(channel_id: int, response_text: str):
 
 
 async def ask_gemini(channel_id: int, user_message: str) -> str:
-    """Send a message to Gemini and return the response."""
-    try:
-        contents = build_contents(channel_id, user_message)
+    """Send a message to Gemini, trying multiple models if rate-limited."""
+    contents = build_contents(channel_id, user_message)
+    last_error = None
 
-        # Run sync Gemini call in a thread to not block the event loop
-        def _call_gemini():
-            return gemini_client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=get_system_prompt(),
-                    temperature=0.7,
-                    max_output_tokens=1024,
-                    top_p=0.9,
-                    tools=[types.Tool(google_search=types.GoogleSearch())],
-                ),
-            )
+    for model_name in GEMINI_MODELS:
+        try:
+            # Only add Google Search for models that support it
+            search_tools = []
+            if model_name not in MODELS_WITHOUT_SEARCH:
+                search_tools = [types.Tool(google_search=types.GoogleSearch())]
 
-        response = await asyncio.to_thread(_call_gemini)
+            def _call_gemini(model=model_name, tools=search_tools):
+                return gemini_client.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=get_system_prompt(),
+                        temperature=0.7,
+                        max_output_tokens=1024,
+                        top_p=0.9,
+                        tools=tools if tools else None,
+                    ),
+                )
 
-        # Log if search grounding was used
-        if response.candidates and response.candidates[0].grounding_metadata:
-            gm = response.candidates[0].grounding_metadata
-            chunks = getattr(gm, 'grounding_chunks', None)
-            if chunks:
-                log.info("Search grounding used: %d sources", len(chunks))
-            else:
-                log.info("No search grounding in response")
-        else:
-            log.info("No grounding metadata in response")
+            response = await asyncio.to_thread(_call_gemini)
 
-        reply = response.text or "Hmm, no pude generar una respuesta. Intenta de nuevo bro 🤔"
-        save_assistant_response(channel_id, reply)
-        return reply
+            # Log which model was used and if search grounding worked
+            log.info("Response from model: %s", model_name)
+            if response.candidates and response.candidates[0].grounding_metadata:
+                gm = response.candidates[0].grounding_metadata
+                chunks = getattr(gm, 'grounding_chunks', None)
+                if chunks:
+                    log.info("Search grounding used: %d sources", len(chunks))
 
-    except Exception as e:
-        log.error("Gemini API error: %s", e, exc_info=True)
-        return f"Ups, tuve un problema conectándome. Intenta de nuevo en un momento ⚠️"
+            reply = response.text or "Hmm, no pude generar una respuesta bro 🤔"
+            save_assistant_response(channel_id, reply)
+            return reply
+
+        except Exception as e:
+            error_str = str(e)
+            last_error = e
+            # If rate limited (429), try next model
+            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                log.warning("Model %s rate-limited, trying next...", model_name)
+                continue
+            # For other errors, stop trying
+            log.error("Gemini API error with %s: %s", model_name, e)
+            break
+
+    log.error("All models failed. Last error: %s", last_error)
+    return "Uf, todos los modelos están ocupados ahorita. Intenta en un ratito ⚠️"
 
 
 # ── Discord Bot ──────────────────────────────────────────────

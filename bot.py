@@ -54,12 +54,15 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 # If one model hits the rate limit, we try the next one
 GEMINI_MODELS = [
     "gemini-3.1-flash-lite",    # 15 RPM, 500 RPD  ← PRINCIPAL (con Google Search)
-    "gemma-4-26b-it",           # 15 RPM, 1500 RPD (sin search, fallback)
-    "gemma-4-31b-it",           # 15 RPM, 1500 RPD (sin search, fallback)
+    "gemini-3.5-flash",         # 5 RPM,  20 RPD
+    "gemini-3-flash",           # 5 RPM,  20 RPD
+    "gemini-2.5-flash",         # 5 RPM,  20 RPD
+    "gemini-2.5-flash-lite",    # 10 RPM, 20 RPD
+    "gemma-4-26b-a4b-it",       # 15 RPM, 1500 RPD (sin search, último recurso)
+    "gemma-4-31b-it",           # 15 RPM, 1500 RPD (sin search, último recurso)
 ]
-# Total: ~3,500 requests por día
 # Gemma models don't support Google Search tool
-MODELS_WITHOUT_SEARCH = {"gemma-4-26b-it", "gemma-4-31b-it"}
+MODELS_WITHOUT_SEARCH = {"gemma-4-26b-a4b-it", "gemma-4-31b-it"}
 
 # ── Conversation Memory ─────────────────────────────────────
 # Stores recent messages per channel for context (max N turns)
@@ -139,13 +142,8 @@ async def ask_gemini(channel_id: int, user_message: str) -> str:
         except Exception as e:
             error_str = str(e)
             last_error = e
-            # If rate limited (429), try next model
-            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                log.warning("Model %s rate-limited, trying next...", model_name)
-                continue
-            # For other errors, stop trying
-            log.error("Gemini API error with %s: %s", model_name, e)
-            break
+            log.warning("Model %s failed with error: %s. Trying next fallback model...", model_name, e)
+            continue
 
     log.error("All models failed. Last error: %s", last_error)
     return "Uf, todos los modelos están ocupados ahorita. Intenta en un ratito ⚠️"

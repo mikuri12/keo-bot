@@ -123,7 +123,7 @@ async def ask_gemini(channel_id: int, user_message: str) -> str:
                     config=types.GenerateContentConfig(
                         system_instruction=get_system_prompt(),
                         temperature=0.7,
-                        max_output_tokens=1024,
+                        max_output_tokens=4096,
                         top_p=0.9,
                         tools=tools if tools else None,
                     ),
@@ -232,13 +232,13 @@ async def on_message(message: discord.Message):
 
     # Split long responses (Discord limit is 2000 chars)
     if len(response) <= 2000:
-        await message.reply(response, mention_author=False)
+        await message.reply(response, mention_author=True)
     else:
         # Split into chunks at line breaks
         chunks = split_response(response)
         for i, chunk in enumerate(chunks):
             if i == 0:
-                await message.reply(chunk, mention_author=False)
+                await message.reply(chunk, mention_author=True)
             else:
                 await message.channel.send(chunk)
 

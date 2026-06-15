@@ -50,19 +50,22 @@ if ALLOWED_CHANNELS_RAW.strip():
 # ── Gemini Client ────────────────────────────────────────────
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Models to try in order — prioritized by daily quota (RPD)
-# If one model hits the rate limit, we try the next one
+# Models to try in order — prioritized by capability / functionality
+# If a model with higher functionality is rate-limited or fails, we fall back to others
 GEMINI_MODELS = [
-    "gemini-3.1-flash-lite",    # 15 RPM, 500 RPD  ← PRINCIPAL (con Google Search)
-    "gemini-3.5-flash",         # 5 RPM,  20 RPD
-    "gemini-3-flash",           # 5 RPM,  20 RPD
-    "gemini-2.5-flash",         # 5 RPM,  20 RPD
+    "gemini-3.5-flash",         # 5 RPM,  20 RPD   ← Mayor funcionalidad
+    "gemini-3-flash",           # 5 RPM,  20 RPD   
+    "gemini-2.5-flash",         # 5 RPM,  20 RPD   
+    "gemini-3.1-flash-lite",    # 15 RPM, 500 RPD  ← Respaldo principal con búsqueda
     "gemini-2.5-flash-lite",    # 10 RPM, 20 RPD
-    "gemma-4-26b-a4b-it",       # 15 RPM, 1500 RPD (sin search, último recurso)
-    "gemma-4-31b-it",           # 15 RPM, 1500 RPD (sin search, último recurso)
+    "gemma-4-31b-it",           # 15 RPM, 1500 RPD (último recurso)
+    "gemma-4-26b-a4b-it",       # 15 RPM, 1500 RPD (último recurso)
 ]
 # Gemma models don't support Google Search tool
 MODELS_WITHOUT_SEARCH = {"gemma-4-26b-a4b-it", "gemma-4-31b-it"}
+
+# Global variable to track the last successfully used model
+last_used_model = "Ninguno"
 
 # ── Conversation Memory ─────────────────────────────────────
 # Stores recent messages per channel for context (max N turns)
@@ -102,6 +105,7 @@ def save_assistant_response(channel_id: int, response_text: str):
 
 async def ask_gemini(channel_id: int, user_message: str) -> str:
     """Send a message to Gemini, trying multiple models if rate-limited."""
+    global last_used_model
     contents = build_contents(channel_id, user_message)
     last_error = None
 
@@ -129,6 +133,8 @@ async def ask_gemini(channel_id: int, user_message: str) -> str:
 
             # Log which model was used and if search grounding worked
             log.info("Response from model: %s", model_name)
+            last_used_model = model_name  # Update last successfully used model
+            
             if response.candidates and response.candidates[0].grounding_metadata:
                 gm = response.candidates[0].grounding_metadata
                 chunks = getattr(gm, 'grounding_chunks', None)
@@ -399,7 +405,7 @@ async def status_command(ctx: commands.Context):
     embed.add_field(name="Latencia", value=f"{round(bot.latency * 1000)}ms", inline=True)
     embed.add_field(name="Mensajes en memoria", value=str(total_history), inline=True)
     embed.add_field(name="Canales activos", value=str(len(channel_history)), inline=True)
-    embed.add_field(name="Modelo IA", value=GEMINI_MODEL, inline=True)
+    embed.add_field(name="Modelo IA", value=last_used_model, inline=True)
     embed.add_field(name="Videos analizados", value=str(video_count), inline=True)
     await ctx.send(embed=embed)
 

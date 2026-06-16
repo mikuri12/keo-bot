@@ -10,6 +10,7 @@ import logging
 import subprocess
 from collections import defaultdict
 from pathlib import Path
+import time
 
 import discord
 import requests
@@ -31,7 +32,7 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 if not NVIDIA_API_KEY:
-    NVIDIA_API_KEY = "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"
+    NVIDIA_API_KEY = "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"
 
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 if not TAVILY_API_KEY:
@@ -52,8 +53,30 @@ if ALLOWED_CHANNELS_RAW.strip():
             ALLOWED_CHANNELS.add(int(ch_id))
 
 # ── NVIDIA Client / Models ───────────────────────────────────
-NVIDIA_MODEL = "moonshotai/kimi-k2.6"
+NVIDIA_MODELS = [
+    "z-ai/glm-5.1",
+    "moonshotai/kimi-k2.6",
+    "meta/llama-3.3-70b-instruct",
+    "deepseek-ai/deepseek-v3",
+]
 last_used_model = "Ninguno"
+
+# ── Usage Statistics ─────────────────────────────────────────
+total_prompt_tokens = 0
+total_completion_tokens = 0
+total_requests = 0
+request_history: list[float] = []      # Timestamps of requests in the last 60s
+token_history: list[tuple[float, int]] = []  # (timestamp, tokens) in the last 60s
+
+
+def record_api_usage(prompt_tok: int, comp_tok: int):
+    global total_prompt_tokens, total_completion_tokens, total_requests
+    now = time.time()
+    total_requests += 1
+    total_prompt_tokens += prompt_tok
+    total_completion_tokens += comp_tok
+    request_history.append(now)
+    token_history.append((now, prompt_tok + comp_tok))
 
 # ── Conversation Memory ─────────────────────────────────────
 # Stores recent messages per channel for context (max N turns)
@@ -126,32 +149,9 @@ def search_tavily(query: str) -> str:
 
 
 async def ask_nvidia(channel_id: int, user_message: str) -> str:
-    """Send a message to NVIDIA API (moonshotai/kimi-k2.6) with optional Tavily web search."""
+    """Send a message to NVIDIA API with fallback models and optional Tavily search."""
     global last_used_model
     contents = build_contents(channel_id, user_message)
-
-    def _call_nvidia(messages, tools=None):
-        invoke_url = "https://integrate.api.nvidia.com/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {NVIDIA_API_KEY}",
-            "Accept": "application/json"
-        }
-        payload = {
-            "model": NVIDIA_MODEL,
-            "messages": messages,
-            "max_tokens": 4096,
-            "temperature": 0.7,
-            "top_p": 0.9,
-            "stream": False,
-        }
-        if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
-            
-        log.info("Sending request to NVIDIA API (model: %s)...", NVIDIA_MODEL)
-        response = requests.post(invoke_url, headers=headers, json=payload, timeout=60)
-        response.raise_for_status()
-        return response.json()
 
     # Define tools for function calling (Tavily search)
     tools = [
@@ -174,58 +174,98 @@ async def ask_nvidia(channel_id: int, user_message: str) -> str:
         }
     ]
 
-    try:
-        system_prompt = get_system_prompt()
-        messages = [{"role": "system", "content": system_prompt}] + contents
-
-        # Try requesting with function calling enabled
-        try:
-            res_json = await asyncio.to_thread(_call_nvidia, messages, tools)
-        except Exception as tool_err:
-            log.warning("NVIDIA tool calling failed: %s. Falling back to direct text generation.", tool_err)
-            res_json = await asyncio.to_thread(_call_nvidia, messages, None)
-
-        choice = res_json["choices"][0]
-        message = choice["message"]
-
-        # If model wants to call the tool
-        if message.get("tool_calls"):
-            tool_calls = message["tool_calls"]
-            messages.append(message)  # Append assistant message with tool call request
-
-            for tool_call in tool_calls:
-                if tool_call["function"]["name"] == "search_tavily":
-                    args = json.loads(tool_call["function"]["arguments"])
-                    query = args.get("query", "")
-                    
-                    # Run the search
-                    search_result = await asyncio.to_thread(search_tavily, query)
-                    
-                    # Append tool response message
-                    tool_message = {
-                        "role": "tool",
-                        "tool_call_id": tool_call["id"],
-                        "name": "search_tavily",
-                        "content": search_result
-                    }
-                    messages.append(tool_message)
+    def _call_nvidia(model_name, messages, use_tools=False):
+        invoke_url = "https://integrate.api.nvidia.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {NVIDIA_API_KEY}",
+            "Accept": "application/json"
+        }
+        payload = {
+            "model": model_name,
+            "messages": messages,
+            "max_tokens": 4096,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "stream": False,
+        }
+        if use_tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
             
-            # Request final answer from model using search context
-            log.info("Sending search results back to NVIDIA API for final response...")
-            res_json = await asyncio.to_thread(_call_nvidia, messages, None)
+        log.info("Sending request to NVIDIA API (model: %s, tools: %s)...", model_name, use_tools)
+        response = requests.post(invoke_url, headers=headers, json=payload, timeout=40)
+        response.raise_for_status()
+        return response.json()
+
+    last_error = None
+    for model_name in NVIDIA_MODELS:
+        try:
+            system_prompt = get_system_prompt()
+            messages = [{"role": "system", "content": system_prompt}] + contents
+
+            # Try requesting with function calling enabled
+            try:
+                res_json = await asyncio.to_thread(_call_nvidia, model_name, messages, True)
+            except Exception as tool_err:
+                log.warning("Tool calling failed for model %s: %s. Trying without tools.", model_name, tool_err)
+                res_json = await asyncio.to_thread(_call_nvidia, model_name, messages, False)
+
+            if "usage" in res_json:
+                usage = res_json["usage"]
+                record_api_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+
             choice = res_json["choices"][0]
             message = choice["message"]
 
-        log.info("Response received successfully from NVIDIA model: %s", NVIDIA_MODEL)
-        last_used_model = NVIDIA_MODEL
+            # If model wants to call the tool
+            if message.get("tool_calls"):
+                tool_calls = message["tool_calls"]
+                temp_messages = list(messages)
+                temp_messages.append(message)  # Append assistant message with tool call request
 
-        reply = message.get("content") or "Hmm, no pude generar una respuesta bro 🤔"
-        save_assistant_response(channel_id, reply)
-        return reply
+                for tool_call in tool_calls:
+                    if tool_call["function"]["name"] == "search_tavily":
+                        args = json.loads(tool_call["function"]["arguments"])
+                        query = args.get("query", "")
+                        
+                        # Run the search
+                        search_result = await asyncio.to_thread(search_tavily, query)
+                        
+                        # Append tool response message
+                        tool_message = {
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "name": "search_tavily",
+                            "content": search_result
+                        }
+                        temp_messages.append(tool_message)
+                
+                # Request final answer from model using search context
+                log.info("Sending search results back to NVIDIA API for final response (model: %s)...", model_name)
+                res_json = await asyncio.to_thread(_call_nvidia, model_name, temp_messages, False)
 
-    except Exception as e:
-        log.error("NVIDIA API failed: %s", e)
-        return "Uf, el modelo de IA no está disponible ahorita. Intenta en un ratito ⚠️"
+                if "usage" in res_json:
+                    usage = res_json["usage"]
+                    record_api_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+
+                choice = res_json["choices"][0]
+                message = choice["message"]
+
+            reply = message.get("content") or ""
+            if reply:
+                log.info("Response received successfully from NVIDIA model: %s", model_name)
+                last_used_model = model_name
+                save_assistant_response(channel_id, reply)
+                return reply
+
+        except Exception as e:
+            log.error("Model %s failed: %s", model_name, e)
+            last_error = e
+            continue
+
+    # If all models fail
+    log.error("All fallback models failed. Last error: %s", last_error)
+    return "Uf, los modelos de IA no están disponibles ahorita. Intenta en un ratito ⚠️"
 
 
 # ── Discord Bot ──────────────────────────────────────────────
@@ -406,7 +446,10 @@ async def ping_command(ctx: commands.Context):
 @bot.command(name="model")
 async def model_command(ctx: commands.Context):
     """Show the currently active AI model."""
-    await ctx.send(f"🤖 El modelo de IA configurado es: **{NVIDIA_MODEL}**")
+    await ctx.send(
+        f"🤖 El modelo de IA principal configurado es: **{NVIDIA_MODELS[0]}**\n"
+        f"(Último modelo usado con éxito: **{last_used_model}**)"
+    )
 
 
 @bot.command(name="clear")
@@ -511,7 +554,7 @@ async def analyze_command(ctx: commands.Context, param: str = "5"):
 
 @bot.command(name="status")
 async def status_command(ctx: commands.Context):
-    """Show bot status."""
+    """Show bot status including API usage statistics."""
     total_history = sum(len(h) for h in channel_history.values())
 
     # Count analyzed videos
@@ -524,16 +567,37 @@ async def status_command(ctx: commands.Context):
         except Exception:
             pass
 
+    # Calculate current RPM / TPM
+    global request_history, token_history
+    now = time.time()
+    request_history = [t for t in request_history if now - t < 60]
+    token_history = [(t, tok) for t, tok in token_history if now - t < 60]
+
+    rpm = len(request_history)
+    tpm = sum(tok for _, tok in token_history)
+    total_tokens = total_prompt_tokens + total_completion_tokens
+
     embed = discord.Embed(
         title="📊 Estado de KeoBot",
         color=0x5555FF,
     )
     embed.add_field(name="Servidores", value=str(len(bot.guilds)), inline=True)
     embed.add_field(name="Latencia", value=f"{round(bot.latency * 1000)}ms", inline=True)
-    embed.add_field(name="Mensajes en memoria", value=str(total_history), inline=True)
-    embed.add_field(name="Canales activos", value=str(len(channel_history)), inline=True)
-    embed.add_field(name="Modelo IA", value=last_used_model, inline=True)
     embed.add_field(name="Videos analizados", value=str(video_count), inline=True)
+    
+    embed.add_field(name="Canales activos", value=str(len(channel_history)), inline=True)
+    embed.add_field(name="Modelo IA (Último)", value=last_used_model, inline=True)
+    embed.add_field(name="Peticiones Totales", value=str(total_requests), inline=True)
+
+    embed.add_field(name="RPM actual (1m)", value=f"{rpm} req/min", inline=True)
+    embed.add_field(name="TPM actual (1m)", value=f"{tpm} tok/min", inline=True)
+    embed.add_field(name="Tokens Totales", value=f"{total_tokens:,}", inline=True)
+
+    embed.add_field(
+        name="Distribución de Tokens",
+        value=f"• Prompt: `{total_prompt_tokens:,}`\n• Completado: `{total_completion_tokens:,}`",
+        inline=False
+    )
     await ctx.send(embed=embed)
 
 

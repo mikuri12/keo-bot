@@ -276,7 +276,8 @@ async def help_command(ctx: commands.Context):
             "`!keo help` - Este mensaje\n"
             "`!keo clear` - Limpiar historial de conversación\n"
             "`!keo ping` - Verificar que estoy vivo\n"
-            "`!keo videos` - Ver videos analizados de Keo"
+            "`!keo videos` - Ver videos analizados de Keo\n"
+            "`!keo model` - Ver el modelo de IA activo"
         ),
         inline=False,
     )
@@ -289,6 +290,12 @@ async def ping_command(ctx: commands.Context):
     """Check bot latency."""
     latency = round(bot.latency * 1000)
     await ctx.send(f"🏓 Pong! Latencia: **{latency}ms**")
+
+
+@bot.command(name="model")
+async def model_command(ctx: commands.Context):
+    """Show the currently active AI model."""
+    await ctx.send(f"🤖 El modelo de IA configurado es: **{NVIDIA_MODEL}**")
 
 
 @bot.command(name="clear")

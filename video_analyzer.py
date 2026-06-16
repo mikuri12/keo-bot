@@ -290,6 +290,7 @@ def main():
     parser.add_argument("--force", action="store_true", help="Re-analyze all videos")
     parser.add_argument("--list", action="store_true", help="List analyzed videos")
     parser.add_argument("--no-cleanup", action="store_true", help="Keep downloaded videos")
+    parser.add_argument("--url", type=str, help="Analyze a specific video URL")
     args = parser.parse_args()
 
     # List mode
@@ -302,6 +303,68 @@ def main():
         for vid_id, data in knowledge["videos"].items():
             analysis = data.get("analysis", {})
             print(f"  [{vid_id}] {analysis.get('titulo', '?')} ({analysis.get('tipo_contenido', '?')})")
+        return
+
+    # URL mode
+    if args.url:
+        knowledge = load_existing_knowledge()
+        url = args.url.strip()
+        
+        log.info("Fetching video info for URL: %s...", url)
+        info_cmd = ["yt-dlp", "--dump-json", "--no-playlist", url]
+        try:
+            result = subprocess.run(info_cmd, capture_output=True, text=True, timeout=60)
+            if result.returncode == 0:
+                info = json.loads(result.stdout)
+                vid_id = info.get("id", "")
+                title = info.get("title", "Sin título")
+            else:
+                log.error("Failed to fetch video info: %s", result.stderr[:200])
+                return
+        except Exception as e:
+            log.error("Failed to run yt-dlp: %s", e)
+            return
+
+        if not vid_id:
+            import hashlib
+            vid_id = hashlib.md5(url.encode()).hexdigest()[:12]
+            title = "Video analizado por URL"
+
+        if vid_id in knowledge["videos"] and not args.force:
+            log.info("Skipping %s (already analyzed)", vid_id)
+            return
+
+        # Download
+        video_path = download_single_video(url, vid_id)
+        if not video_path:
+            log.error("Could not download video.")
+            return
+
+        # Analyze with Gemini
+        analysis = analyze_video_with_gemini(video_path)
+        if not analysis:
+            log.error("Analysis failed.")
+            return
+
+        # Store
+        knowledge["videos"][vid_id] = {
+            "url": url,
+            "title": title,
+            "analyzed_at": datetime.now().isoformat(),
+            "analysis": analysis,
+        }
+        
+        save_knowledge(knowledge)
+        
+        if not args.no_cleanup:
+            cleanup_videos()
+            
+        print("\n" + "=" * 60)
+        print("KNOWLEDGE SUMMARY FOR SINGLE VIDEO")
+        print("=" * 60)
+        print(f"Video: {title}")
+        print(f"Tipo: {analysis.get('tipo_contenido', 'N/A')}")
+        print(f"Resumen: {analysis.get('resumen', 'N/A')}")
         return
 
     # Analyze mode

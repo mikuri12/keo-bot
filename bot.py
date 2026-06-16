@@ -422,17 +422,31 @@ async def videos_command(ctx: commands.Context):
 
 @bot.command(name="analyze")
 @commands.has_role(ADMIN_ROLE)
-async def analyze_command(ctx: commands.Context, max_videos: int = 5):
-    """Trigger video analysis (admin only). Usage: !keo analyze [max_videos]"""
-    await ctx.send(
-        f"📺 Analizando los últimos **{max_videos}** videos de Keo...\n"
-        "Esto puede tardar unos minutos. Te aviso cuando termine."
-    )
+async def analyze_command(ctx: commands.Context, param: str = "5"):
+    """Trigger video analysis (admin only). Usage: !keo analyze [max_videos | video_url]"""
+    is_url = param.strip().startswith("http")
+
+    if is_url:
+        await ctx.send(
+            "📺 Analizando el video de TikTok proporcionado...\n"
+            "Esto puede tardar un par de minutos. Te aviso cuando termine."
+        )
+        args = ["video_analyzer.py", "--url", param.strip()]
+    else:
+        try:
+            max_videos = int(param)
+        except ValueError:
+            max_videos = 5
+        await ctx.send(
+            f"📺 Analizando los últimos **{max_videos}** videos de Keo...\n"
+            "Esto puede tardar unos minutos. Te aviso cuando termine."
+        )
+        args = ["video_analyzer.py", "--max", str(max_videos)]
 
     try:
         # Run the analyzer script as a subprocess
         process = await asyncio.create_subprocess_exec(
-            "python", "video_analyzer.py", "--max", str(max_videos),
+            "python", *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(Path(__file__).parent),
@@ -440,17 +454,22 @@ async def analyze_command(ctx: commands.Context, max_videos: int = 5):
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=600)
 
         if process.returncode == 0:
-            # Count analyzed videos
-            knowledge_file = Path(__file__).parent / "video_knowledge.json"
-            count = 0
-            if knowledge_file.exists():
-                data = json.loads(knowledge_file.read_text(encoding="utf-8"))
-                count = len(data.get("videos", {}))
+            if is_url:
+                await ctx.send(
+                    "✅ ¡Análisis del video completado con éxito! Se ha agregado a mi base de conocimiento. 🧠"
+                )
+            else:
+                # Count analyzed videos
+                knowledge_file = Path(__file__).parent / "video_knowledge.json"
+                count = 0
+                if knowledge_file.exists():
+                    data = json.loads(knowledge_file.read_text(encoding="utf-8"))
+                    count = len(data.get("videos", {}))
 
-            await ctx.send(
-                f"✅ ¡Análisis completado! Ahora tengo **{count}** videos en mi base de conocimiento.\n"
-                "Ya puedo responder preguntas sobre el contenido de Keo 🧠"
-            )
+                await ctx.send(
+                    f"✅ ¡Análisis completado! Ahora tengo **{count}** videos en mi base de conocimiento.\n"
+                    "Ya puedo responder preguntas sobre el contenido de Keo 🧠"
+                )
         else:
             error_msg = stderr.decode()[:500] if stderr else "Error desconocido"
             await ctx.send(f"❌ Error durante el análisis:\n```\n{error_msg}\n```")

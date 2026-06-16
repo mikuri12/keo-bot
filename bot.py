@@ -316,6 +316,18 @@ async def on_message(message: discord.Message):
                 await message.channel.send(chunk)
 
 
+@bot.event
+async def on_command_error(ctx: commands.Context, error: Exception):
+    """Handle command errors and notify users."""
+    if isinstance(error, commands.MissingRole):
+        await ctx.send(f"❌ No tienes permiso para usar este comando. Se requiere el rol: **{error.missing_role}**")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"⚠️ Falta un argumento obligatorio: {error.param.name}")
+    else:
+        log.error("Command error: %s", error)
+        await ctx.send(f"❌ Ocurrió un error al ejecutar el comando: {error}")
+
+
 def split_response(text: str, max_len: int = 1900) -> list[str]:
     """Split a long response into Discord-friendly chunks."""
     if len(text) <= max_len:

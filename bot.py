@@ -1,6 +1,6 @@
 """
 KeoBot - Discord assistant for Keo's Minecraft community.
-Uses Gemini API for AI responses with a curated system prompt.
+Uses NVIDIA API with Kimi-K2.6 model for AI responses.
 """
 
 import asyncio
@@ -12,10 +12,9 @@ from collections import defaultdict
 from pathlib import Path
 
 import discord
+import requests
 from discord.ext import commands
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
 
 from system_prompt import get_system_prompt
 
@@ -30,14 +29,15 @@ log = logging.getLogger("keobot")
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+if not NVIDIA_API_KEY:
+    NVIDIA_API_KEY = "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"
+
 ALLOWED_CHANNELS_RAW = os.getenv("ALLOWED_CHANNELS", "")
 ADMIN_ROLE = os.getenv("ADMIN_ROLE", "Admin")
 
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN is not set. Check your .env file.")
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is not set. Check your .env file.")
 
 # Parse allowed channels (empty = respond everywhere when mentioned)
 ALLOWED_CHANNELS: set[int] = set()
@@ -47,43 +47,27 @@ if ALLOWED_CHANNELS_RAW.strip():
         if ch_id.isdigit():
             ALLOWED_CHANNELS.add(int(ch_id))
 
-# ── Gemini Client ────────────────────────────────────────────
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-
-# Models to try in order — prioritized by capability / functionality
-# If a model with higher functionality is rate-limited or fails, we fall back to others
-GEMINI_MODELS = [
-    "gemini-3.5-flash",         # 5 RPM,  20 RPD   ← Mayor funcionalidad
-    "gemini-3-flash",           # 5 RPM,  20 RPD   
-    "gemini-2.5-flash",         # 5 RPM,  20 RPD   
-    "gemini-3.1-flash-lite",    # 15 RPM, 500 RPD  ← Respaldo principal con búsqueda
-    "gemini-2.5-flash-lite",    # 10 RPM, 20 RPD
-    "gemma-4-31b-it",           # 15 RPM, 1500 RPD (último recurso)
-    "gemma-4-26b-a4b-it",       # 15 RPM, 1500 RPD (último recurso)
-]
-# Gemma models don't support Google Search tool
-MODELS_WITHOUT_SEARCH = {"gemma-4-26b-a4b-it", "gemma-4-31b-it"}
-
-# Global variable to track the last successfully used model
+# ── NVIDIA Client / Models ───────────────────────────────────
+NVIDIA_MODEL = "moonshotai/kimi-k2.6"
 last_used_model = "Ninguno"
 
 # ── Conversation Memory ─────────────────────────────────────
 # Stores recent messages per channel for context (max N turns)
 MAX_HISTORY = 10
 
-# Dict[channel_id, list of Content objects]
-channel_history: dict[int, list] = defaultdict(list)
+# Dict[channel_id, list of dicts]
+channel_history: dict[int, list[dict]] = defaultdict(list)
 
 
-def build_contents(channel_id: int, user_message: str) -> list:
-    """Build the conversation contents list for Gemini, including history."""
+def build_contents(channel_id: int, user_message: str) -> list[dict]:
+    """Build the conversation contents list including history."""
     history = channel_history[channel_id]
 
     # Add user message to history
-    user_content = types.Content(
-        role="user",
-        parts=[types.Part.from_text(text=user_message)],
-    )
+    user_content = {
+        "role": "user",
+        "content": user_message,
+    }
     history.append(user_content)
 
     # Trim history if too long
@@ -96,63 +80,53 @@ def build_contents(channel_id: int, user_message: str) -> list:
 
 def save_assistant_response(channel_id: int, response_text: str):
     """Save assistant response to history."""
-    model_content = types.Content(
-        role="model",
-        parts=[types.Part.from_text(text=response_text)],
-    )
+    model_content = {
+        "role": "assistant",
+        "content": response_text,
+    }
     channel_history[channel_id].append(model_content)
 
 
-async def ask_gemini(channel_id: int, user_message: str) -> str:
-    """Send a message to Gemini, trying multiple models if rate-limited."""
+async def ask_nvidia(channel_id: int, user_message: str) -> str:
+    """Send a message to NVIDIA API (moonshotai/kimi-k2.6)."""
     global last_used_model
     contents = build_contents(channel_id, user_message)
-    last_error = None
 
-    for model_name in GEMINI_MODELS:
-        try:
-            # Only add Google Search for models that support it
-            search_tools = []
-            if model_name not in MODELS_WITHOUT_SEARCH:
-                search_tools = [types.Tool(google_search=types.GoogleSearch())]
+    try:
+        def _call_nvidia():
+            invoke_url = "https://integrate.api.nvidia.com/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {NVIDIA_API_KEY}",
+                "Accept": "application/json"
+            }
+            messages = [{"role": "system", "content": get_system_prompt()}] + contents
+            payload = {
+                "model": NVIDIA_MODEL,
+                "messages": messages,
+                "max_tokens": 4096,
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "stream": False,
+            }
+            log.info("Sending request to NVIDIA API using model: %s", NVIDIA_MODEL)
+            response = requests.post(invoke_url, headers=headers, json=payload, timeout=60)
+            response.raise_for_status()
+            return response.json()
 
-            def _call_gemini(model=model_name, tools=search_tools):
-                return gemini_client.models.generate_content(
-                    model=model,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=get_system_prompt(),
-                        temperature=0.7,
-                        max_output_tokens=4096,
-                        top_p=0.9,
-                        tools=tools if tools else None,
-                    ),
-                )
+        res_json = await asyncio.to_thread(_call_nvidia)
+        log.info("Response received successfully from NVIDIA model: %s", NVIDIA_MODEL)
+        last_used_model = NVIDIA_MODEL
 
-            response = await asyncio.to_thread(_call_gemini)
-
-            # Log which model was used and if search grounding worked
-            log.info("Response from model: %s", model_name)
-            last_used_model = model_name  # Update last successfully used model
-            
-            if response.candidates and response.candidates[0].grounding_metadata:
-                gm = response.candidates[0].grounding_metadata
-                chunks = getattr(gm, 'grounding_chunks', None)
-                if chunks:
-                    log.info("Search grounding used: %d sources", len(chunks))
-
-            reply = response.text or "Hmm, no pude generar una respuesta bro 🤔"
+        reply = res_json["choices"][0]["message"]["content"]
+        if reply:
             save_assistant_response(channel_id, reply)
             return reply
+        else:
+            return "Hmm, no pude generar una respuesta bro 🤔"
 
-        except Exception as e:
-            error_str = str(e)
-            last_error = e
-            log.warning("Model %s failed with error: %s. Trying next fallback model...", model_name, e)
-            continue
-
-    log.error("All models failed. Last error: %s", last_error)
-    return "Uf, todos los modelos están ocupados ahorita. Intenta en un ratito ⚠️"
+    except Exception as e:
+        log.error("NVIDIA API failed: %s", e)
+        return "Uf, el modelo de IA no está disponible ahorita. Intenta en un ratito ⚠️"
 
 
 # ── Discord Bot ──────────────────────────────────────────────
@@ -228,7 +202,7 @@ async def on_message(message: discord.Message):
 
     # Show typing indicator while processing
     async with message.channel.typing():
-        response = await ask_gemini(message.channel.id, user_context)
+        response = await ask_nvidia(message.channel.id, user_context)
 
     # Split long responses (Discord limit is 2000 chars)
     if len(response) <= 2000:

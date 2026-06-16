@@ -33,6 +33,10 @@ NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 if not NVIDIA_API_KEY:
     NVIDIA_API_KEY = "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"
 
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+if not TAVILY_API_KEY:
+    TAVILY_API_KEY = "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"
+
 ALLOWED_CHANNELS_RAW = os.getenv("ALLOWED_CHANNELS", "")
 ADMIN_ROLE = os.getenv("ADMIN_ROLE", "Admin")
 
@@ -87,42 +91,137 @@ def save_assistant_response(channel_id: int, response_text: str):
     channel_history[channel_id].append(model_content)
 
 
+def search_tavily(query: str) -> str:
+    """Search the web using Tavily API and format results for the LLM."""
+    try:
+        url = "https://api.tavily.com/search"
+        payload = {
+            "api_key": TAVILY_API_KEY,
+            "query": query,
+            "search_depth": "basic",
+            "include_answer": True,
+            "max_results": 3
+        }
+        log.info("Querying Tavily search: '%s'", query)
+        response = requests.post(url, json=payload, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        
+        results = data.get("results", [])
+        if not results:
+            return "No se encontraron resultados en internet."
+            
+        formatted = []
+        if data.get("answer"):
+            formatted.append(f"Resumen de la búsqueda: {data['answer']}\n")
+        
+        formatted.append("Resultados web:")
+        for idx, item in enumerate(results, 1):
+            formatted.append(f"{idx}. {item['title']}\n   URL: {item['url']}\n   Contenido: {item['content']}")
+            
+        return "\n".join(formatted)
+    except Exception as e:
+        log.error("Tavily search failed: %s", e)
+        return f"Error al buscar en internet: {e}"
+
+
 async def ask_nvidia(channel_id: int, user_message: str) -> str:
-    """Send a message to NVIDIA API (moonshotai/kimi-k2.6)."""
+    """Send a message to NVIDIA API (moonshotai/kimi-k2.6) with optional Tavily web search."""
     global last_used_model
     contents = build_contents(channel_id, user_message)
 
-    try:
-        def _call_nvidia():
-            invoke_url = "https://integrate.api.nvidia.com/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {NVIDIA_API_KEY}",
-                "Accept": "application/json"
-            }
-            messages = [{"role": "system", "content": get_system_prompt()}] + contents
-            payload = {
-                "model": NVIDIA_MODEL,
-                "messages": messages,
-                "max_tokens": 4096,
-                "temperature": 0.7,
-                "top_p": 0.9,
-                "stream": False,
-            }
-            log.info("Sending request to NVIDIA API using model: %s", NVIDIA_MODEL)
-            response = requests.post(invoke_url, headers=headers, json=payload, timeout=60)
-            response.raise_for_status()
-            return response.json()
+    def _call_nvidia(messages, tools=None):
+        invoke_url = "https://integrate.api.nvidia.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {NVIDIA_API_KEY}",
+            "Accept": "application/json"
+        }
+        payload = {
+            "model": NVIDIA_MODEL,
+            "messages": messages,
+            "max_tokens": 4096,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "stream": False,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+            
+        log.info("Sending request to NVIDIA API (model: %s)...", NVIDIA_MODEL)
+        response = requests.post(invoke_url, headers=headers, json=payload, timeout=60)
+        response.raise_for_status()
+        return response.json()
 
-        res_json = await asyncio.to_thread(_call_nvidia)
+    # Define tools for function calling (Tavily search)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search_tavily",
+                "description": "Busca en internet información en tiempo real sobre Minecraft, mods, launchers, tutoriales, videos, noticias o dudas técnicas de los usuarios.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "La consulta de búsqueda detallada a realizar en español"
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }
+    ]
+
+    try:
+        system_prompt = get_system_prompt()
+        messages = [{"role": "system", "content": system_prompt}] + contents
+
+        # Try requesting with function calling enabled
+        try:
+            res_json = await asyncio.to_thread(_call_nvidia, messages, tools)
+        except Exception as tool_err:
+            log.warning("NVIDIA tool calling failed: %s. Falling back to direct text generation.", tool_err)
+            res_json = await asyncio.to_thread(_call_nvidia, messages, None)
+
+        choice = res_json["choices"][0]
+        message = choice["message"]
+
+        # If model wants to call the tool
+        if message.get("tool_calls"):
+            tool_calls = message["tool_calls"]
+            messages.append(message)  # Append assistant message with tool call request
+
+            for tool_call in tool_calls:
+                if tool_call["function"]["name"] == "search_tavily":
+                    args = json.loads(tool_call["function"]["arguments"])
+                    query = args.get("query", "")
+                    
+                    # Run the search
+                    search_result = await asyncio.to_thread(search_tavily, query)
+                    
+                    # Append tool response message
+                    tool_message = {
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "name": "search_tavily",
+                        "content": search_result
+                    }
+                    messages.append(tool_message)
+            
+            # Request final answer from model using search context
+            log.info("Sending search results back to NVIDIA API for final response...")
+            res_json = await asyncio.to_thread(_call_nvidia, messages, None)
+            choice = res_json["choices"][0]
+            message = choice["message"]
+
         log.info("Response received successfully from NVIDIA model: %s", NVIDIA_MODEL)
         last_used_model = NVIDIA_MODEL
 
-        reply = res_json["choices"][0]["message"]["content"]
-        if reply:
-            save_assistant_response(channel_id, reply)
-            return reply
-        else:
-            return "Hmm, no pude generar una respuesta bro 🤔"
+        reply = message.get("content") or "Hmm, no pude generar una respuesta bro 🤔"
+        save_assistant_response(channel_id, reply)
+        return reply
 
     except Exception as e:
         log.error("NVIDIA API failed: %s", e)

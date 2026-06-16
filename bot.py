@@ -433,9 +433,8 @@ async def videos_command(ctx: commands.Context):
 
 
 @bot.command(name="analyze")
-@commands.has_role(ADMIN_ROLE)
 async def analyze_command(ctx: commands.Context, param: str = "5"):
-    """Trigger video analysis (admin only). Usage: !keo analyze [max_videos | video_url]"""
+    """Trigger video analysis. Usage: !keo analyze [max_videos | video_url]"""
     is_url = param.strip().startswith("http")
 
     if is_url:
@@ -455,6 +454,9 @@ async def analyze_command(ctx: commands.Context, param: str = "5"):
         )
         args = ["video_analyzer.py", "--max", str(max_videos)]
 
+    log.info("Starting video analyzer subprocess: python %s", " ".join(args))
+    await ctx.send("⚙️ Ejecutando script de análisis en el servidor...")
+
     try:
         # Run the analyzer script as a subprocess
         process = await asyncio.create_subprocess_exec(
@@ -464,6 +466,16 @@ async def analyze_command(ctx: commands.Context, param: str = "5"):
             cwd=str(Path(__file__).parent),
         )
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=600)
+
+        log.info("Subprocess finished with return code: %d", process.returncode)
+        
+        stdout_str = stdout.decode("utf-8", errors="replace") if stdout else ""
+        stderr_str = stderr.decode("utf-8", errors="replace") if stderr else ""
+
+        if stdout_str:
+            log.info("Analyzer stdout:\n%s", stdout_str)
+        if stderr_str:
+            log.warning("Analyzer stderr:\n%s", stderr_str)
 
         if process.returncode == 0:
             if is_url:
@@ -483,19 +495,23 @@ async def analyze_command(ctx: commands.Context, param: str = "5"):
                     "Ya puedo responder preguntas sobre el contenido de Keo 🧠"
                 )
         else:
-            error_msg = stderr.decode()[:500] if stderr else "Error desconocido"
-            await ctx.send(f"❌ Error durante el análisis:\n```\n{error_msg}\n```")
+            error_msg = stderr_str if stderr_str else "Error desconocido"
+            await ctx.send(
+                f"❌ Error durante el análisis (Código de salida: {process.returncode}):\n"
+                f"```\n{error_msg[:1800]}\n```"
+            )
 
     except asyncio.TimeoutError:
-        await ctx.send("⏰ El análisis tardó demasiado y fue cancelado.")
+        log.error("Video analyzer subprocess timed out.")
+        await ctx.send("⏰ El análisis tardó demasiado (límite de 10 minutos) y fue cancelado.")
     except Exception as e:
-        await ctx.send(f"❌ Error: {e}")
+        log.error("Failed to run video analyzer: %s", e)
+        await ctx.send(f"❌ Error al ejecutar el script de análisis: {e}")
 
 
 @bot.command(name="status")
-@commands.has_role(ADMIN_ROLE)
 async def status_command(ctx: commands.Context):
-    """Show bot status (admin only)."""
+    """Show bot status."""
     total_history = sum(len(h) for h in channel_history.values())
 
     # Count analyzed videos

@@ -40,6 +40,7 @@ if not TAVILY_API_KEY:
 
 ALLOWED_CHANNELS_RAW = os.getenv("ALLOWED_CHANNELS", "")
 ADMIN_ROLE = os.getenv("ADMIN_ROLE", "Admin")
+ALLOWED_BOT_IDS_RAW = os.getenv("ALLOWED_BOT_IDS", "")
 
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN is not set. Check your .env file.")
@@ -51,6 +52,14 @@ if ALLOWED_CHANNELS_RAW.strip():
         ch_id = ch_id.strip()
         if ch_id.isdigit():
             ALLOWED_CHANNELS.add(int(ch_id))
+
+# Parse allowed bot IDs
+ALLOWED_BOT_IDS: set[int] = set()
+if ALLOWED_BOT_IDS_RAW.strip():
+    for bot_id in ALLOWED_BOT_IDS_RAW.split(","):
+        bot_id = bot_id.strip()
+        if bot_id.isdigit():
+            ALLOWED_BOT_IDS.add(int(bot_id))
 
 # ── NVIDIA Client / Models ───────────────────────────────────
 NVIDIA_MODELS = [
@@ -294,8 +303,12 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Ignore self and other bots
-    if message.author.bot:
+    # Ignore self
+    if message.author == bot.user:
+        return
+
+    # Ignore other bots unless their ID is specifically allowed
+    if message.author.bot and message.author.id not in ALLOWED_BOT_IDS:
         return
 
     # Process commands first (e.g., !keo ping, !keo help)

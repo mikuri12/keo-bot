@@ -261,6 +261,44 @@ async def ask_nvidia(channel_id: int, user_message: str) -> str:
                 message = choice["message"]
 
             reply = message.get("content") or ""
+
+            # If the model returned tool calls via GLM-style raw text tags
+            if "<|tool_call_begin|>" in reply:
+                try:
+                    import re
+                    match = re.search(
+                        r"<\|tool_call_argument_begin\|>\s*(\{.*?\})\s*<\|tool_call_end\|>",
+                        reply,
+                        re.DOTALL
+                    )
+                    if match:
+                        args_str = match.group(1)
+                        args = json.loads(args_str)
+                        query = args.get("query", "")
+                        
+                        log.info("Parsed GLM raw tool call query: %s", query)
+                        search_result = await asyncio.to_thread(search_tavily, query)
+                        
+                        temp_messages = list(messages)
+                        temp_messages.append({"role": "assistant", "content": reply})
+                        temp_messages.append({
+                            "role": "user",
+                            "content": f"[Resultados de búsqueda en internet para '{query}']:\n{search_result}\n\nPor favor, responde al usuario usando esta información."
+                        })
+                        
+                        log.info("Sending tool results back to NVIDIA API for GLM final response...")
+                        res_json = await asyncio.to_thread(_call_nvidia, model_name, temp_messages, False)
+
+                        if "usage" in res_json:
+                            usage = res_json["usage"]
+                            record_api_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+
+                        choice = res_json["choices"][0]
+                        message = choice["message"]
+                        reply = message.get("content") or ""
+                except Exception as tool_parse_err:
+                    log.error("Error parsing GLM raw tool call: %s", tool_parse_err)
+
             if reply:
                 log.info("Response received successfully from NVIDIA model: %s", model_name)
                 last_used_model = model_name
@@ -306,6 +344,16 @@ async def on_message(message: discord.Message):
     # Ignore self
     if message.author == bot.user:
         return
+
+    # Log command-like messages from bots or users to help debug integrations
+    if message.content.startswith("!keo "):
+        log.info(
+            "Command detected: author=%s (bot=%s, ID=%s) content=%r",
+            message.author,
+            message.author.bot,
+            message.author.id,
+            message.content
+        )
 
     # Ignore other bots unless their ID is specifically allowed
     if message.author.bot and message.author.id not in ALLOWED_BOT_IDS:

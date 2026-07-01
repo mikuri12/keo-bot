@@ -12,9 +12,11 @@ from collections import defaultdict
 from pathlib import Path
 import time
 
+import re
+
 import discord
 import requests
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 from system_prompt import get_system_prompt
@@ -157,27 +159,185 @@ def search_tavily(query: str) -> str:
         return f"Error al buscar en internet: {e}"
 
 
+def search_reddit(query: str) -> str:
+    """Search Reddit's public JSON API for threads (no auth needed)."""
+    try:
+        url = "https://www.reddit.com/search.json"
+        params = {"q": query, "limit": 5, "sort": "relevance", "t": "all"}
+        headers = {"User-Agent": "KeoBot/1.0 (Minecraft Discord assistant)"}
+        log.info("Querying Reddit search: '%s'", query)
+        response = requests.get(url, params=params, headers=headers, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+
+        posts = data.get("data", {}).get("children", [])
+        if not posts:
+            return "No se encontraron hilos de Reddit para esa búsqueda."
+
+        formatted = ["Hilos de Reddit encontrados:"]
+        for idx, post in enumerate(posts, 1):
+            p = post.get("data", {})
+            title = p.get("title", "Sin título")
+            subreddit = p.get("subreddit_name_prefixed", "")
+            permalink = p.get("permalink", "")
+            selftext = (p.get("selftext", "") or "")[:400]
+            score = p.get("score", 0)
+            link = f"https://www.reddit.com{permalink}"
+            formatted.append(
+                f"{idx}. [{subreddit}] {title} (score: {score})\n"
+                f"   URL: {link}\n"
+                f"   {selftext}".rstrip()
+            )
+        return "\n".join(formatted)
+    except Exception as e:
+        log.error("Reddit search failed: %s", e)
+        return f"Error al buscar en Reddit: {e}"
+
+
+def fetch_url(url: str) -> str:
+    """Fetch a web page and return cleaned text content (max ~4000 chars)."""
+    try:
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        headers = {"User-Agent": "Mozilla/5.0 (KeoBot; Minecraft Discord assistant)"}
+        log.info("Fetching URL: %s", url)
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+
+        text = response.text
+        # Quitar scripts/estilos y tags para dejar texto legible
+        text = re.sub(r"(?is)<(script|style|noscript).*?</\1>", " ", text)
+        text = re.sub(r"(?is)<br\s*/?>", "\n", text)
+        text = re.sub(r"(?is)</(p|div|li|h[1-6]|tr)>", "\n", text)
+        text = re.sub(r"(?s)<[^>]+>", " ", text)
+        # Decodificar entidades HTML comunes
+        import html as _html
+        text = _html.unescape(text)
+        # Colapsar espacios en blanco
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n\s*\n+", "\n\n", text).strip()
+
+        if not text:
+            return "La página no devolvió contenido de texto legible."
+        return f"Contenido de {url}:\n{text[:4000]}"
+    except Exception as e:
+        log.error("Fetch URL failed: %s", e)
+        return f"Error al leer la página: {e}"
+
+
+def get_tiktok_info(url: str) -> str:
+    """Get metadata (title, description) of a TikTok/video URL via yt-dlp."""
+    try:
+        log.info("Fetching TikTok/video info: %s", url)
+        result = subprocess.run(
+            ["yt-dlp", "--dump-json", "--no-playlist", "--skip-download", url],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0:
+            return f"No se pudo obtener info del video: {result.stderr[:200]}"
+
+        info = json.loads(result.stdout)
+        title = info.get("title", "Sin título")
+        desc = (info.get("description", "") or "")[:800]
+        uploader = info.get("uploader", info.get("channel", "?"))
+        duration = info.get("duration", 0)
+        return (
+            f"Info del video:\n"
+            f"- Autor: {uploader}\n"
+            f"- Título: {title}\n"
+            f"- Duración: {duration}s\n"
+            f"- Descripción: {desc}"
+        )
+    except FileNotFoundError:
+        return "yt-dlp no está instalado en el servidor."
+    except subprocess.TimeoutExpired:
+        return "Tiempo agotado obteniendo info del video."
+    except Exception as e:
+        log.error("TikTok info failed: %s", e)
+        return f"Error al obtener info del video: {e}"
+
+
+# Mapa nombre -> función para el dispatcher de tool calls
+TOOL_FUNCTIONS = {
+    "search_tavily": lambda a: search_tavily(a.get("query", "")),
+    "search_reddit": lambda a: search_reddit(a.get("query", "")),
+    "fetch_url": lambda a: fetch_url(a.get("url", "")),
+    "get_tiktok_info": lambda a: get_tiktok_info(a.get("url", "")),
+}
+
+
 async def ask_nvidia(channel_id: int, user_message: str) -> str:
     """Send a message to NVIDIA API with fallback models and optional Tavily search."""
     global last_used_model
     contents = build_contents(channel_id, user_message)
 
-    # Define tools for function calling (Tavily search)
+    # Herramientas de function calling disponibles para el modelo
     tools = [
         {
             "type": "function",
             "function": {
                 "name": "search_tavily",
-                "description": "Busca en internet información en tiempo real sobre Minecraft, mods, launchers, tutoriales, videos, noticias o dudas técnicas de los usuarios.",
+                "description": "Busca en internet información en tiempo real sobre Minecraft: mods, launchers, shaders, tutoriales, versiones, noticias o dudas técnicas. Úsalo cuando no tengas la información con certeza.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "La consulta de búsqueda detallada a realizar en español"
+                            "description": "La consulta de búsqueda detallada en español"
                         }
                     },
                     "required": ["query"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "search_reddit",
+                "description": "Busca hilos en Reddit. Útil para errores técnicos complejos de Minecraft (crashes de Java, conflictos de mods, shaders, optimización) donde la comunidad ya publicó soluciones. Devuelve títulos, enlaces y extractos.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Términos de búsqueda, preferiblemente en inglés para mejores resultados técnicos (ej: 'minecraft fabric sodium crash exit code 1')"
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "fetch_url",
+                "description": "Lee el contenido de texto de una página web concreta (documentación, hilo de Reddit, wiki, página de un mod en Modrinth/CurseForge). Úsalo para leer en detalle un enlace que ya conoces o que apareció en una búsqueda.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "La URL completa a leer"
+                        }
+                    },
+                    "required": ["url"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_tiktok_info",
+                "description": "Obtiene metadatos (autor, título, descripción, duración) de un enlace de video de TikTok/YouTube. Úsalo cuando un usuario comparte un enlace de video y pregunta de qué trata.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "La URL del video de TikTok o YouTube"
+                        }
+                    },
+                    "required": ["url"]
                 }
             }
         }
@@ -200,11 +360,24 @@ async def ask_nvidia(channel_id: int, user_message: str) -> str:
         if use_tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
-            
+
         log.info("Sending request to NVIDIA API (model: %s, tools: %s)...", model_name, use_tools)
         response = requests.post(invoke_url, headers=headers, json=payload, timeout=40)
         response.raise_for_status()
         return response.json()
+
+    def _account_usage(res_json):
+        if "usage" in res_json:
+            usage = res_json["usage"]
+            record_api_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+
+    async def _run_tool(name: str, args: dict) -> str:
+        func = TOOL_FUNCTIONS.get(name)
+        if not func:
+            return f"Herramienta '{name}' no disponible."
+        return await asyncio.to_thread(func, args)
+
+    MAX_TOOL_ROUNDS = 4  # Evita loops infinitos de tool calls
 
     last_error = None
     for model_name in NVIDIA_MODELS:
@@ -212,92 +385,66 @@ async def ask_nvidia(channel_id: int, user_message: str) -> str:
             system_prompt = get_system_prompt()
             messages = [{"role": "system", "content": system_prompt}] + contents
 
-            # Try requesting with function calling enabled
-            try:
-                res_json = await asyncio.to_thread(_call_nvidia, model_name, messages, True)
-            except Exception as tool_err:
-                log.warning("Tool calling failed for model %s: %s. Trying without tools.", model_name, tool_err)
-                res_json = await asyncio.to_thread(_call_nvidia, model_name, messages, False)
+            reply = ""
+            for round_idx in range(MAX_TOOL_ROUNDS):
+                use_tools = True
+                try:
+                    res_json = await asyncio.to_thread(_call_nvidia, model_name, messages, True)
+                except Exception as tool_err:
+                    log.warning("Tool calling failed for model %s: %s. Trying without tools.", model_name, tool_err)
+                    res_json = await asyncio.to_thread(_call_nvidia, model_name, messages, False)
+                    use_tools = False
 
-            if "usage" in res_json:
-                usage = res_json["usage"]
-                record_api_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+                _account_usage(res_json)
+                message = res_json["choices"][0]["message"]
 
-            choice = res_json["choices"][0]
-            message = choice["message"]
-
-            # If model wants to call the tool
-            if message.get("tool_calls"):
-                tool_calls = message["tool_calls"]
-                temp_messages = list(messages)
-                temp_messages.append(message)  # Append assistant message with tool call request
-
-                for tool_call in tool_calls:
-                    if tool_call["function"]["name"] == "search_tavily":
-                        args = json.loads(tool_call["function"]["arguments"])
-                        query = args.get("query", "")
-                        
-                        # Run the search
-                        search_result = await asyncio.to_thread(search_tavily, query)
-                        
-                        # Append tool response message
-                        tool_message = {
+                # Tool calls estándar (OpenAI-style)
+                if use_tools and message.get("tool_calls"):
+                    messages.append(message)
+                    for tool_call in message["tool_calls"]:
+                        fname = tool_call["function"]["name"]
+                        try:
+                            fargs = json.loads(tool_call["function"]["arguments"] or "{}")
+                        except json.JSONDecodeError:
+                            fargs = {}
+                        log.info("Model requested tool '%s' args=%s", fname, fargs)
+                        result = await _run_tool(fname, fargs)
+                        messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call["id"],
-                            "name": "search_tavily",
-                            "content": search_result
-                        }
-                        temp_messages.append(tool_message)
-                
-                # Request final answer from model using search context
-                log.info("Sending search results back to NVIDIA API for final response (model: %s)...", model_name)
-                res_json = await asyncio.to_thread(_call_nvidia, model_name, temp_messages, False)
-
-                if "usage" in res_json:
-                    usage = res_json["usage"]
-                    record_api_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
-
-                choice = res_json["choices"][0]
-                message = choice["message"]
-
-            reply = message.get("content") or ""
-
-            # If the model returned tool calls via GLM-style raw text tags
-            if "<|tool_call_begin|>" in reply:
-                try:
-                    import re
-                    match = re.search(
-                        r"<\|tool_call_argument_begin\|>\s*(\{.*?\})\s*<\|tool_call_end\|>",
-                        reply,
-                        re.DOTALL
-                    )
-                    if match:
-                        args_str = match.group(1)
-                        args = json.loads(args_str)
-                        query = args.get("query", "")
-                        
-                        log.info("Parsed GLM raw tool call query: %s", query)
-                        search_result = await asyncio.to_thread(search_tavily, query)
-                        
-                        temp_messages = list(messages)
-                        temp_messages.append({"role": "assistant", "content": reply})
-                        temp_messages.append({
-                            "role": "user",
-                            "content": f"[Resultados de búsqueda en internet para '{query}']:\n{search_result}\n\nPor favor, responde al usuario usando esta información."
+                            "name": fname,
+                            "content": result,
                         })
-                        
-                        log.info("Sending tool results back to NVIDIA API for GLM final response...")
-                        res_json = await asyncio.to_thread(_call_nvidia, model_name, temp_messages, False)
+                    continue  # otra ronda: el modelo procesa los resultados
 
-                        if "usage" in res_json:
-                            usage = res_json["usage"]
-                            record_api_usage(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+                reply = message.get("content") or ""
 
-                        choice = res_json["choices"][0]
-                        message = choice["message"]
-                        reply = message.get("content") or ""
-                except Exception as tool_parse_err:
-                    log.error("Error parsing GLM raw tool call: %s", tool_parse_err)
+                # Fallback: tool calls estilo GLM en texto crudo
+                glm_match = re.search(
+                    r"<\|tool_call_begin\|>\s*(?P<name>[\w\.]+)?.*?"
+                    r"<\|tool_call_argument_begin\|>\s*(?P<args>\{.*?\})\s*<\|tool_call_end\|>",
+                    reply,
+                    re.DOTALL,
+                )
+                if glm_match:
+                    try:
+                        fname = (glm_match.group("name") or "search_tavily").split(".")[-1].strip()
+                        if fname not in TOOL_FUNCTIONS:
+                            fname = "search_tavily"
+                        fargs = json.loads(glm_match.group("args"))
+                        log.info("Parsed GLM raw tool call '%s' args=%s", fname, fargs)
+                        result = await _run_tool(fname, fargs)
+                        messages.append({"role": "assistant", "content": reply})
+                        messages.append({
+                            "role": "user",
+                            "content": f"[Resultado de la herramienta '{fname}']:\n{result}\n\nResponde al usuario usando esta información.",
+                        })
+                        reply = ""
+                        continue  # otra ronda con el resultado inyectado
+                    except Exception as glm_err:
+                        log.error("Error parsing GLM raw tool call: %s", glm_err)
+
+                break  # respuesta final sin más tool calls
 
             if reply:
                 log.info("Response received successfully from NVIDIA model: %s", model_name)
@@ -337,6 +484,46 @@ async def on_ready():
             name="Minecraft ⛏️ | @me para preguntar",
         )
     )
+    # Arrancar el reset periódico (solo una vez)
+    if not periodic_reset.is_running():
+        periodic_reset.start()
+
+
+@tasks.loop(hours=2)
+async def periodic_reset():
+    """Cada 2h: limpia el historial de conversación y re-analiza los videos de Keo.
+
+    El historial en memoria acumula contexto viejo mezclado entre temas y
+    usuarios, lo que degrada la coherencia con el tiempo. Reiniciarlo mantiene
+    las respuestas frescas. El conocimiento de videos se recarga solo del JSON
+    en cada mensaje (get_system_prompt), así que aquí solo hay que actualizar
+    ese JSON re-corriendo el analizador.
+    """
+    channel_history.clear()
+    log.info("Historial de conversación reseteado (ciclo de 2h)")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "python", "video_analyzer.py", "--max", "5",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(Path(__file__).parent),
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
+        if proc.returncode == 0:
+            log.info("Re-análisis de videos completado (ciclo de 2h)")
+        else:
+            err = stderr.decode("utf-8", errors="replace")[:500] if stderr else "?"
+            log.warning("Re-análisis de videos falló (rc=%s): %s", proc.returncode, err)
+    except asyncio.TimeoutError:
+        log.error("Re-análisis de videos superó el tiempo límite (10 min)")
+    except Exception as e:
+        log.error("Fallo al re-analizar videos en el ciclo de 2h: %s", e)
+
+
+@periodic_reset.before_loop
+async def _before_periodic_reset():
+    await bot.wait_until_ready()
 
 
 @bot.event
@@ -476,8 +663,9 @@ async def help_command(ctx: commands.Context):
         value=(
             "• Responder dudas sobre Minecraft\n"
             "• Ayudarte con mods y launchers\n"
-            "• Info sobre el server de Keo\n"
-            "• Tips y trucos de Minecraft\n"
+            "• Buscar soluciones en internet y Reddit\n"
+            "• Leer páginas web y enlaces de videos\n"
+            "• Info sobre el contenido de Keo (videos analizados)\n"
             "• Resolver problemas técnicos"
         ),
         inline=False,

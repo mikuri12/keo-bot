@@ -266,6 +266,25 @@ TOOL_FUNCTIONS = {
 }
 
 
+def _strip_tool_tags(text: str) -> str:
+    """Elimina etiquetas de tool call en texto crudo que algunos modelos filtran.
+
+    Red de seguridad final: si el modelo emitió etiquetas <|tool_call...|> o
+    bloques 'functions.<nombre>' y no se pudieron procesar, no deben llegar
+    nunca al chat del usuario.
+    """
+    if not text:
+        return text
+    # Quitar secciones completas de tool call
+    text = re.sub(r"<\|tool_calls?_section_begin\|>.*?(?:<\|tool_calls?_section_end\|>|$)", "", text, flags=re.DOTALL)
+    text = re.sub(r"<\|tool_call_begin\|>.*?(?:<\|tool_call_end\|>|$)", "", text, flags=re.DOTALL)
+    # Quitar cualquier etiqueta <|...|> residual
+    text = re.sub(r"<\|[^|]*\|>", "", text)
+    # Quitar restos tipo 'functions.search_tavily:6 {"query": ...}'
+    text = re.sub(r"functions\.\w+(?::\d+)?\s*(\{.*\})?", "", text, flags=re.DOTALL)
+    return text.strip()
+
+
 async def ask_nvidia(channel_id: int, user_message: str) -> str:
     """Send a message to NVIDIA API with fallback models and optional Tavily search."""
     global last_used_model
@@ -419,32 +438,55 @@ async def ask_nvidia(channel_id: int, user_message: str) -> str:
 
                 reply = message.get("content") or ""
 
-                # Fallback: tool calls estilo GLM en texto crudo
-                glm_match = re.search(
-                    r"<\|tool_call_begin\|>\s*(?P<name>[\w\.]+)?.*?"
-                    r"<\|tool_call_argument_begin\|>\s*(?P<args>\{.*?\})\s*<\|tool_call_end\|>",
-                    reply,
-                    re.DOTALL,
-                )
-                if glm_match:
+                # Fallback: algunos modelos (GLM) emiten los tool calls como
+                # texto crudo con etiquetas <|...|>, y a veces con JSON malformado
+                # (comillas sin escapar). Detectamos ampliamente y extraemos el
+                # argumento aunque el JSON no parsee.
+                if "<|tool_call" in reply or "tool_calls_section" in reply or "functions." in reply:
+                    # Nombre de la función: functions.<nombre>[:id]
+                    name_match = re.search(r"functions\.(\w+)", reply)
+                    fname = name_match.group(1) if name_match else "search_tavily"
+                    if fname not in TOOL_FUNCTIONS:
+                        fname = "search_tavily"
+
+                    # Bloque de argumentos tras la etiqueta (o todo el texto)
+                    arg_match = re.search(
+                        r"<\|tool_call_argument_begin\|>\s*(\{.*)", reply, re.DOTALL
+                    )
+                    raw_args = arg_match.group(1) if arg_match else reply
+                    raw_args = re.split(r"<\|tool_call", raw_args)[0].strip()
+
+                    fargs = {}
                     try:
-                        fname = (glm_match.group("name") or "search_tavily").split(".")[-1].strip()
-                        if fname not in TOOL_FUNCTIONS:
-                            fname = "search_tavily"
-                        fargs = json.loads(glm_match.group("args"))
+                        fargs = json.loads(raw_args)
+                    except Exception:
+                        # JSON roto: extraer el valor de query/url a mano.
+                        val_match = re.search(
+                            r'"(?:query|url)"\s*:\s*"(.+?)"\s*\}?\s*$',
+                            raw_args,
+                            re.DOTALL,
+                        )
+                        if val_match:
+                            key = "url" if fname in ("fetch_url", "get_tiktok_info") else "query"
+                            fargs = {key: val_match.group(1).strip()}
+
+                    if fargs:
                         log.info("Parsed GLM raw tool call '%s' args=%s", fname, fargs)
                         result = await _run_tool(fname, fargs)
                         messages.append({"role": "assistant", "content": reply})
                         messages.append({
                             "role": "user",
-                            "content": f"[Resultado de la herramienta '{fname}']:\n{result}\n\nResponde al usuario usando esta información.",
+                            "content": f"[Resultado de la herramienta '{fname}']:\n{result}\n\nResponde al usuario en lenguaje natural usando esta información. NO incluyas etiquetas de tool call.",
                         })
                         reply = ""
                         continue  # otra ronda con el resultado inyectado
-                    except Exception as glm_err:
-                        log.error("Error parsing GLM raw tool call: %s", glm_err)
+                    else:
+                        log.warning("No se pudo extraer args del tool call crudo; se limpiará el texto.")
 
                 break  # respuesta final sin más tool calls
+
+            # Red de seguridad: nunca dejar pasar etiquetas de tool call al chat.
+            reply = _strip_tool_tags(reply)
 
             if reply:
                 log.info("Response received successfully from NVIDIA model: %s", model_name)

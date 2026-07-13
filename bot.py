@@ -1,6 +1,6 @@
 """
 KeoBot - Discord assistant for Keo's Minecraft community.
-Uses NVIDIA NIM API with GLM-5.2 model for AI responses.
+Uses the CrowLLM gateway (OpenAI-compatible) with GLM-5.1-thinking for AI responses.
 """
 
 import asyncio
@@ -32,9 +32,12 @@ log = logging.getLogger("keobot")
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
-if not NVIDIA_API_KEY:
-    raise RuntimeError("NVIDIA_API_KEY is not set. Check your .env file.")
+CROWLLM_API_KEY = os.getenv("CROWLLM_API_KEY")
+if not CROWLLM_API_KEY:
+    raise RuntimeError("CROWLLM_API_KEY is not set. Check your .env file.")
+
+# Base URL del gateway CrowLLM (OpenAI-compatible). Configurable por si cambia.
+CROWLLM_BASE_URL = os.getenv("CROWLLM_BASE_URL", "https://crowllm.com/v1")
 
 FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY")
 if not FIRECRAWL_API_KEY:
@@ -63,13 +66,10 @@ if ALLOWED_BOT_IDS_RAW.strip():
         if bot_id.isdigit():
             ALLOWED_BOT_IDS.add(int(bot_id))
 
-# ── NVIDIA Client / Models ───────────────────────────────────
-NVIDIA_MODELS = [
-    "z-ai/glm-5.2",
-    "z-ai/glm-5.1",
-    "moonshotai/kimi-k2.6",
-    "meta/llama-3.3-70b-instruct",
-    "deepseek-ai/deepseek-v3",
+# ── CrowLLM Client / Models ──────────────────────────────────
+# Modelo principal + fallbacks. Ajusta según lo disponible en tu cuenta CrowLLM.
+CROWLLM_MODELS = [
+    "glm-5.1-thinking",
 ]
 last_used_model = "Ninguno"
 
@@ -293,8 +293,8 @@ def _strip_tool_tags(text: str) -> str:
     return text.strip()
 
 
-async def ask_nvidia(channel_id: int, user_message: str) -> str:
-    """Send a message to NVIDIA API with fallback models and optional web search."""
+async def ask_llm(channel_id: int, user_message: str) -> str:
+    """Send a message to CrowLLM with fallback models and optional web search."""
     global last_used_model
     contents = build_contents(channel_id, user_message)
 
@@ -370,10 +370,10 @@ async def ask_nvidia(channel_id: int, user_message: str) -> str:
         }
     ]
 
-    def _call_nvidia(model_name, messages, use_tools=False):
-        invoke_url = "https://integrate.api.nvidia.com/v1/chat/completions"
+    def _call_crowllm(model_name, messages, use_tools=False):
+        invoke_url = f"{CROWLLM_BASE_URL}/chat/completions"
         headers = {
-            "Authorization": f"Bearer {NVIDIA_API_KEY}",
+            "Authorization": f"Bearer {CROWLLM_API_KEY}",
             "Accept": "application/json"
         }
         payload = {
@@ -388,8 +388,10 @@ async def ask_nvidia(channel_id: int, user_message: str) -> str:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
 
-        log.info("Sending request to NVIDIA API (model: %s, tools: %s)...", model_name, use_tools)
-        response = requests.post(invoke_url, headers=headers, json=payload, timeout=40)
+        log.info("Sending request to CrowLLM (model: %s, tools: %s)...", model_name, use_tools)
+        # Timeout amplio: los modelos 'thinking' razonan antes de responder y
+        # el gateway free puede encolar en horas pico.
+        response = requests.post(invoke_url, headers=headers, json=payload, timeout=120)
         response.raise_for_status()
         return response.json()
 
@@ -407,7 +409,7 @@ async def ask_nvidia(channel_id: int, user_message: str) -> str:
     MAX_TOOL_ROUNDS = 4  # Evita loops infinitos de tool calls
 
     last_error = None
-    for model_name in NVIDIA_MODELS:
+    for model_name in CROWLLM_MODELS:
         try:
             system_prompt = get_system_prompt()
             messages = [{"role": "system", "content": system_prompt}] + contents
@@ -416,10 +418,10 @@ async def ask_nvidia(channel_id: int, user_message: str) -> str:
             for round_idx in range(MAX_TOOL_ROUNDS):
                 use_tools = True
                 try:
-                    res_json = await asyncio.to_thread(_call_nvidia, model_name, messages, True)
+                    res_json = await asyncio.to_thread(_call_crowllm, model_name, messages, True)
                 except Exception as tool_err:
                     log.warning("Tool calling failed for model %s: %s. Trying without tools.", model_name, tool_err)
-                    res_json = await asyncio.to_thread(_call_nvidia, model_name, messages, False)
+                    res_json = await asyncio.to_thread(_call_crowllm, model_name, messages, False)
                     use_tools = False
 
                 _account_usage(res_json)
@@ -497,7 +499,7 @@ async def ask_nvidia(channel_id: int, user_message: str) -> str:
             reply = _strip_tool_tags(reply)
 
             if reply:
-                log.info("Response received successfully from NVIDIA model: %s", model_name)
+                log.info("Response received successfully from CrowLLM model: %s", model_name)
                 last_used_model = model_name
                 save_assistant_response(channel_id, reply)
                 return reply
@@ -639,7 +641,7 @@ async def on_message(message: discord.Message):
 
     # Show typing indicator while processing
     async with message.channel.typing():
-        response = await ask_nvidia(message.channel.id, user_context)
+        response = await ask_llm(message.channel.id, user_context)
 
     # Split long responses (Discord limit is 2000 chars)
     if len(response) <= 2000:
@@ -746,7 +748,7 @@ async def ping_command(ctx: commands.Context):
 async def model_command(ctx: commands.Context):
     """Show the currently active AI model."""
     await ctx.send(
-        f"🤖 El modelo de IA principal configurado es: **{NVIDIA_MODELS[0]}**\n"
+        f"🤖 El modelo de IA principal configurado es: **{CROWLLM_MODELS[0]}**\n"
         f"(Último modelo usado con éxito: **{last_used_model}**)"
     )
 

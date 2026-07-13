@@ -275,14 +275,19 @@ TOOL_FUNCTIONS = {
 
 
 def _strip_tool_tags(text: str) -> str:
-    """Elimina etiquetas de tool call en texto crudo que algunos modelos filtran.
+    """Elimina etiquetas de tool call y bloques <think> que algunos modelos filtran.
 
-    Red de seguridad final: si el modelo emitió etiquetas <|tool_call...|> o
-    bloques 'functions.<nombre>' y no se pudieron procesar, no deben llegar
-    nunca al chat del usuario.
+    Red de seguridad final: si el modelo emitió etiquetas <|tool_call...|>,
+    bloques 'functions.<nombre>' o razonamiento <think>...</think> y no se
+    procesaron, no deben llegar nunca al chat del usuario.
     """
     if not text:
         return text
+    # Quitar bloques de razonamiento <think>...</think> de modelos 'thinking'.
+    # Si el bloque quedó sin cerrar, elimina desde <think> hasta el final.
+    text = re.sub(r"<think>.*?(?:</think>|$)", "", text, flags=re.DOTALL | re.IGNORECASE)
+    # Quitar una etiqueta </think> huérfana (cuando el <think> no vino en el texto)
+    text = re.sub(r"</?think>", "", text, flags=re.IGNORECASE)
     # Quitar secciones completas de tool call
     text = re.sub(r"<\|tool_calls?_section_begin\|>.*?(?:<\|tool_calls?_section_end\|>|$)", "", text, flags=re.DOTALL)
     text = re.sub(r"<\|tool_call_begin\|>.*?(?:<\|tool_call_end\|>|$)", "", text, flags=re.DOTALL)

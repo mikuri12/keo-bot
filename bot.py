@@ -1,6 +1,6 @@
 """
 KeoBot - Discord assistant for Keo's Minecraft community.
-Uses NVIDIA API with Kimi-K2.6 model for AI responses.
+Uses NVIDIA NIM API with GLM-5.2 model for AI responses.
 """
 
 import asyncio
@@ -34,11 +34,11 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 if not NVIDIA_API_KEY:
-    NVIDIA_API_KEY = "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"
+    raise RuntimeError("NVIDIA_API_KEY is not set. Check your .env file.")
 
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-if not TAVILY_API_KEY:
-    TAVILY_API_KEY = "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"
+FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY")
+if not FIRECRAWL_API_KEY:
+    log.warning("FIRECRAWL_API_KEY no está configurada; la búsqueda web fallará hasta agregarla al .env")
 
 ALLOWED_CHANNELS_RAW = os.getenv("ALLOWED_CHANNELS", "")
 ADMIN_ROLE = os.getenv("ADMIN_ROLE", "Admin")
@@ -65,6 +65,7 @@ if ALLOWED_BOT_IDS_RAW.strip():
 
 # ── NVIDIA Client / Models ───────────────────────────────────
 NVIDIA_MODELS = [
+    "z-ai/glm-5.2",
     "z-ai/glm-5.1",
     "moonshotai/kimi-k2.6",
     "meta/llama-3.3-70b-instruct",
@@ -125,37 +126,44 @@ def save_assistant_response(channel_id: int, response_text: str):
     channel_history[channel_id].append(model_content)
 
 
-def search_tavily(query: str) -> str:
-    """Search the web using Tavily API and format results for the LLM."""
+def search_firecrawl(query: str) -> str:
+    """Search the web using Firecrawl v2 API and format results for the LLM."""
+    if not FIRECRAWL_API_KEY:
+        return "La búsqueda web no está configurada (falta FIRECRAWL_API_KEY)."
     try:
-        url = "https://api.tavily.com/search"
-        payload = {
-            "api_key": TAVILY_API_KEY,
-            "query": query,
-            "search_depth": "basic",
-            "include_answer": True,
-            "max_results": 3
+        url = "https://api.firecrawl.dev/v2/search"
+        headers = {
+            "Authorization": f"Bearer {FIRECRAWL_API_KEY}",
+            "Content-Type": "application/json",
         }
-        log.info("Querying Tavily search: '%s'", query)
-        response = requests.post(url, json=payload, timeout=15)
+        payload = {
+            "query": query,
+            "limit": 3,
+            "sources": ["web"],
+            # Pide un resumen scrapeado de cada resultado para dar contexto al modelo
+            "scrapeOptions": {"formats": [{"type": "summary"}]},
+        }
+        log.info("Querying Firecrawl search: '%s'", query)
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
         response.raise_for_status()
         data = response.json()
-        
-        results = data.get("results", [])
+
+        # v2 devuelve los resultados web en data["web"] (o data["data"]["web"])
+        body = data.get("data", data)
+        results = body.get("web") or body.get("results") or []
         if not results:
             return "No se encontraron resultados en internet."
-            
-        formatted = []
-        if data.get("answer"):
-            formatted.append(f"Resumen de la búsqueda: {data['answer']}\n")
-        
-        formatted.append("Resultados web:")
+
+        formatted = ["Resultados web:"]
         for idx, item in enumerate(results, 1):
-            formatted.append(f"{idx}. {item['title']}\n   URL: {item['url']}\n   Contenido: {item['content']}")
-            
+            title = item.get("title", "Sin título")
+            link = item.get("url", "")
+            content = item.get("summary") or item.get("description", "")
+            formatted.append(f"{idx}. {title}\n   URL: {link}\n   Contenido: {content}")
+
         return "\n".join(formatted)
     except Exception as e:
-        log.error("Tavily search failed: %s", e)
+        log.error("Firecrawl search failed: %s", e)
         return f"Error al buscar en internet: {e}"
 
 
@@ -259,7 +267,7 @@ def get_tiktok_info(url: str) -> str:
 
 # Mapa nombre -> función para el dispatcher de tool calls
 TOOL_FUNCTIONS = {
-    "search_tavily": lambda a: search_tavily(a.get("query", "")),
+    "search_web": lambda a: search_firecrawl(a.get("query", "")),
     "search_reddit": lambda a: search_reddit(a.get("query", "")),
     "fetch_url": lambda a: fetch_url(a.get("url", "")),
     "get_tiktok_info": lambda a: get_tiktok_info(a.get("url", "")),
@@ -286,7 +294,7 @@ def _strip_tool_tags(text: str) -> str:
 
 
 async def ask_nvidia(channel_id: int, user_message: str) -> str:
-    """Send a message to NVIDIA API with fallback models and optional Tavily search."""
+    """Send a message to NVIDIA API with fallback models and optional web search."""
     global last_used_model
     contents = build_contents(channel_id, user_message)
 
@@ -295,7 +303,7 @@ async def ask_nvidia(channel_id: int, user_message: str) -> str:
         {
             "type": "function",
             "function": {
-                "name": "search_tavily",
+                "name": "search_web",
                 "description": "Busca en internet información en tiempo real sobre Minecraft: mods, launchers, shaders, tutoriales, versiones, noticias o dudas técnicas. Úsalo cuando no tengas la información con certeza.",
                 "parameters": {
                     "type": "object",
@@ -445,9 +453,9 @@ async def ask_nvidia(channel_id: int, user_message: str) -> str:
                 if "<|tool_call" in reply or "tool_calls_section" in reply or "functions." in reply:
                     # Nombre de la función: functions.<nombre>[:id]
                     name_match = re.search(r"functions\.(\w+)", reply)
-                    fname = name_match.group(1) if name_match else "search_tavily"
+                    fname = name_match.group(1) if name_match else "search_web"
                     if fname not in TOOL_FUNCTIONS:
-                        fname = "search_tavily"
+                        fname = "search_web"
 
                     # Bloque de argumentos tras la etiqueta (o todo el texto)
                     arg_match = re.search(
